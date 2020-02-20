@@ -1,0 +1,940 @@
+---
+title: "A hierarchical model of hotel property transactions"
+author: "Thomas Loeber"
+date: "July 10, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Initialization
+Let's start by clearing the workspace. Next, we load packages and saved models, and then import our data and create new variables. 
+(For the most part, new variables were already created when cleaning the 
+data in Python, the only exception are variables that should be of type "factor",
+which is specific to R.)
+
+```{r}
+# clear the workspace
+rm(list = ls())
+
+# Load packages and set up Stan
+library(rstan)
+library(miscTools)
+rstan_options(auto_write = TRUE)  #Save compiled model for faster re-estimation
+options(mc.cores = parallel::detectCores())  #Enable using multiple cores
+
+# # Load saved models
+# for (file in (list.files(pattern = "*.RData"))) load(file)
+# rm(file)  #remove temporary variable
+
+# import data
+data_train <- read.table("./data/data_train_R.csv", 
+                         header = TRUE, sep = ",")
+data_test <- read.table("./data/data_test_R.csv", 
+                        header = TRUE, sep = ",",
+                        stringsAsFactors = FALSE)
+
+# Change all years in test set to 2016, because that's the most similar year
+# we have data for.
+data_test[, "year"] <- 2016
+
+# Add a copy of year that we will convert to factor, because we will treat it
+# as random effect
+data_train$year_factor <- as.factor(data_train$year)
+data_test$year_factor <- data_test$year
+
+# # Concatenate all factors from both training and test set 
+factor_vars <- c("msa", "tract", "category", "saleaffiliation", "year_factor")
+# data_all_factors <- rbind(data_train[, factor_vars],
+#                           data_test[, factor_vars])
+# # Convert each variable to a factor to get proper encoding
+# for (v in factor_vars) {
+#   data_all_factors[, v] <- as.factor(data_all_factors[, v])
+# }
+
+# Convert categorical variables to factor using encoding from combined training
+# and test set.
+for (v in factor_vars) {
+  # Convert each variable in test set to factor using levels from training set
+  data_test[, v] <- factor(data_test[, v], 
+                           levels = levels(data_train[, v]))
+}
+
+# See how many observations we lose by dropping categories with new levels
+sum(complete.cases(data_test) == FALSE)
+# We only lose 32 observation, so let's get rid of those
+data_test <- data_test[complete.cases(data_test), ]
+
+```
+
+## Preprocessing
+I already cleaned the data in a previous notebook, but one last step is to standardize all numeric independent variables and then put them in a list that we can pass to Stan.
+
+As will become clearer below when I lay out the Stan code, the data need to come in a list containing all the variables used in the calculations. I thus define a function to which we pass the names of the dependent varible, independent variables, and random effects. The function then outputs a list containing all the necessary elements required by our Stan funciton. 
+In addition, this function also allows us to standardize the numeric predictors. I follow Andrew Gelman's recommendation to standardize the predictor by dividing by two standard deviations, rather than one, as is common in machine learning. The advantage is that this brings the standard deviation of numeric variables closer to the standard deviation of
+binary variables, which ranges from zero for unbalanced variables to 0.5 for balanced variables. In order to achieve this custom standardization, I define another function that can be called by the function assembling the data list.
+
+```{r}
+### Function to standardize predictors:
+standardize <- function(df) {
+  # standardizes continuous variables by dividing by 2 standard
+  # deviations (in order to keep sd similar to binary inputs).
+  #
+  # Args:
+  #   df: data frame or matrix with numeric inputs
+  #
+  # Returns: 
+  #   same data type as input (data frame or matrix), containing standardized 
+  #   variables, plus two vectors with means and standard deviations, 
+  #   respectively, of variables that were standardized.
+  
+  # Create new data frame or matrix, depending on input, to be returned
+  df_2 <- df
+  
+  # Initialize vectors to save means and standard deviations of standardized variables (will remain NA for non-continuous variables)
+  means <- rep(NA, ncol(df))
+  std_dev <- rep(NA, ncol(df))
+  names(means) <- colnames(df)
+  names(std_dev) <- colnames(df)
+  
+  # Loop over all variables to standardize them, if appropriate
+  n_features = dim(df)[2]
+  for (feature in 1:n_features) {
+    # test whether feature is a factor (if so, skip to the next feature):
+    if (is.factor(df[, feature])) 
+      next
+    
+    # tests whether feature's range is 0-1; skip if so
+    if ((min(df[, feature]) == 0) && (max(df[, feature]) == 1)) {
+      
+      # for computational efficiency, only test whether the feature only maps onto 2 values if we already made sure its minimum and
+      # maximum are 0 and 1 respectively: If it's range does consist of only 2 values, skip to the next feature.
+      if (length(table(df[, feature])) == 2) 
+        next
+    }
+    
+    # Standardize Continuous features
+    mu = mean(df[, feature])
+    sigma = sd(df[, feature])
+    df_2[, feature] <- (df[, feature] - mu)/(2 * sigma)
+    
+    # Save means and standard deviations.
+    means[feature] <- mu
+    std_dev[feature] <- sigma
+  }
+  
+  return(list(data = df_2, means = means, std_dev = std_dev))
+}
+
+# S_1_1 <-standardize (X_1_1) summary (S_1_1)
+
+```
+
+```{r}
+### Function to create vectorized Stan input
+make_stan_data <- function(y, fe_formula, groups = NULL,       data, test_data, standardize_X = TRUE, standardize_y = FALSE) {
+  # Creates a list in the right format to pass to Stan as data for estimating a 
+  # hierarchical model (convert factors to dummy variables). Missing values 
+  # need to be removed or imputed before data are passed to this function.
+  # If the target variable is not standardized, it also returns its mean (mu_y)
+  # and standard deviation (sd_y), which can be used to set an informative prior
+  # for the intercept. If the features are standardized, it returns a vector of
+  # their means and standard deviations to convert coefficients to original 
+  # scale.
+  #
+  # Args:
+  #   y: character, containing name of target variable.
+  #   fe_formula: character, containing the formula for the fixed effects.
+  #   groups: character vector, with each element referencing a grouping 
+  #         variable of type factor. Default value: no groups. 
+  #   data: data.frame, containing all the variables referenced above.  
+  #         Factors will automatically be converted to integers using
+  #         one-hot-encoding. 
+  #   standardize_X: boolean variable, denoting whether to standardize X.
+  #         (Divides by 2 standard deviations to keep variance similar to
+  #         binary variables, as long as those are not to unbalanced).
+  #         Default: True.
+  #   standardize_y: boolean variable, denoting whether to standardize y.
+  #         (Divides by 2 standard deviations). Default: False.
+  #
+  # Returns: 
+  #   list, can be directly passed to stan() as the data argument
+  
+  
+  # Check that none of the grouping variables for the random effects is also included in the fixed effects
+  library(stringr)
+  for (group in groups) {
+    if (str_detect(fe_formula, group)) {
+      # raise warning rather than error because the name of the grouping variable may simply appear as a substring of a different
+      # variable.
+      warning(paste(group, "may appear both as a fixed and random effect"))
+    }
+  }
+  
+  # Create model matrix (for automatic one-hot encoding of factors)
+  model_formula <- as.formula(paste("~", fe_formula))
+  mm <- model.matrix(model_formula, data = data)
+  # mm_test <- model.matrix(model_formula, data = data_test)
+  
+  # Replace dots, if any, in variable names (necessary for Stan)
+  for (i in 1:dim(mm)[2]) {
+    colnames(mm)[i] <- str_replace_all(colnames(mm)[i], " ", "")
+  }
+  # Do the same for test data
+  # colnames(mm_test) <- colnames(mm)
+  
+  # Extract X by deleting 1st column of ones
+  X <- mm[, -1]
+  # X_test <- mm_test[, -1]
+  
+  # Start a list with variables to be returned
+  data_list = list(K = (ncol(mm) - 1), 
+                   N = nrow(mm))
+                   # N_test = nrow(mm_test))
+  
+  # Standardize continuous variables in X, if requested, and add to data list
+  if (standardize_X == TRUE) {
+    X_standardized <- standardize(X)
+    data_list$X <- X_standardized$data
+    # data_list$X_test <- X_test # Must already be transformed
+    data_list$mu_x <- X_standardized$means
+    data_list$sd_x <- X_standardized$std_dev
+  
+    # Otherwise, just add X
+    } else {
+      data_list$X <- X
+      # data_list$X_test <- X_test
+    }
+  
+  # Add the target y (under its proper name)
+  if (standardize_y == FALSE) {
+    data_list[[y]] <- data[, y]  #Remember that y is a string
+    data_list$mu_y <- mean(data[, y])
+    data_list$sd_y <- sd(data[, y])
+    
+    # Standardize, if requested.  Note that this function only works on data frames, so we use drop = F to preserve the type data frame,
+    # and then convert it to vector by subsetting
+  } else {
+    y_standardized <- standardize(data[, y, drop = FALSE])
+    data_list[[y]] <- y_standardized$data[, 1]
+    data_list$mu_y <- y_standardized$means
+    data_list$sd_y <- y_standardized$std_dev
+  }
+  
+  # if more than 1 group, store the number of groups
+  if (length(groups) > 1) {
+    data_list$n_J <- length(groups)
+  }
+  # Add number of groups in each grouping variable
+  group_counter <- 1
+  for (group in groups) {
+    # Convert grouping variable to continuous set of integers
+    data_list[[group]] <- as.integer(data[, group])
+    
+    # Make sure factors are numbered by CONTINUOUS integers if (is.factor(data[, group])){ data_list[[group]] <-as.integer(data
+    # [,group]) } else { data_list[[group]] <-as.integer (as.factor (data [, group])) }
+    
+    if (length(data_list[[group]]) != data_list$N) {
+      stop("Error: Missing observations found.")
+    }
+    # add number of groups
+    if (length(groups) == 1) 
+      data_list$J <- length(unique(data_list[[group]]))
+    if (length(groups) > 1) {
+      data_list[paste("J", group, sep = "_")] <- length(unique(data_list[[group]]))
+    }
+    
+    # assert that groups are named by CONSECUTIVE integers (Stan requirement) Potential for failure: Empty factor categories stopifnot
+    # (data_list $J == max (data_list[[group_name]]))
+    
+    group_counter <- group_counter + 1
+  }
+  return(data_list)
+}
+```
+
+Let's go ahead and create the list with the Stan data.  
+
+```{r}
+# Put the training data in the right format for Stan
+stan_data_1_3 <- make_stan_data (
+  "log_saleprice","log_sizesf + log1_landsf +
+  log1_age + log_rooms + log_floors + log1_largestmeetingspace + operation + 
+  selfrun + portfolio + multiproperty + location  +  cbd + indoorcorridors + 
+  restaurant + convention + conference + ski + spa + golf + boutique + 
+  allsuites + casino + quarter",
+  c("msa", "tract", "category", "saleaffiliation", "year_factor"),
+  data = data_train)
+
+# Create test data (not standardized)
+stan_test_data_1_3 <- make_stan_data (
+  "log_saleprice","log_sizesf + log1_landsf +
+  log1_age + log_rooms + log_floors + log1_largestmeetingspace + operation + 
+  selfrun + portfolio + multiproperty + location  +  cbd + indoorcorridors + 
+  restaurant + convention + conference + ski + spa + golf + boutique + 
+  allsuites + casino + quarter",
+  c("msa", "tract", "category", "saleaffiliation", "year_factor"),
+  standardize_X = FALSE,
+  data = data_test)
+
+# Get the mean and standard deviation of the numeric variables from training set
+mu_train <- stan_data_1_3$mu_x
+sd_train <- stan_data_1_3$sd_x
+
+# Transform numeric variables based on test set standardization
+for (col_name in colnames(stan_test_data_1_3$X)) {
+  # Skip variables that we didn't standardize 
+  # (They will have missing values for mean and stand. dev.)
+  if (is.na(mu_train[col_name])) next
+  # Otherwise, multiplied by std. dev. and add mean
+  stan_test_data_1_3$X[,col_name] <- (stan_test_data_1_3$X[, col_name] - mu_train[col_name]) /
+                                 sd_train[col_name]
+}
+
+# The "self-run" variable happens to be constant in the test set, which led to
+# all NAs when computing X through model.matrix.  Let's manually set it to 0.
+stan_test_data_1_3$X[, "selfrun"] <- 0
+
+# Take a look whether it looks right
+summary(as.data.frame(stan_test_data_1_3$X))
+
+# Add each element in test set Stan data to training set Stan data
+for (element in names(stan_test_data_1_3)) {
+  # Append "_test" to name
+  new_name <- paste0(element, "_test")
+  # Add to list of training data
+  stan_data_1_3[new_name] <- stan_test_data_1_3[element]
+}
+```
+
+# Model Estimation
+In addition to a model containing logarithms for all non-negative numeric features, I also estimated models were I used quadratic terms for some variables instead.  The purpose was to model non-linearities of variables such as we age. In the case of the latter, we suspect that up to a point older hotels will fetch a lower price, but that after some threshold, increasing age will make hotels more expensive.
+
+However, the problem with quadratic terms is that polynomials tend to behave erratically far away from the mean.  An analysis of the residuals confirmed this issue. While it is undoubtedly important to model such non-linearities, we need a more flexible model to do so.  An example of statistical models that provide such flexibility would be loess-regression and smoothing splines. Future iterations of this project may try estimating these, but in the next notebook, a train machine learning models (namely XGBoost) that is able to model these kinds of nonlinearities.
+
+In the interest of brevity, I will only present findings from the final model that contains only logs but no polynomials. 
+
+```{r}
+stan_1_3_code <- "
+data {
+  int<lower=0> N;
+  int<lower=0> K;
+  int<lower=0> n_J; //Number of grouping variables
+  int<lower=0> J_msa;  //Number of groups in each grouping variable
+  int<lower=0> J_tract;
+  int<lower=0> J_category;
+  int<lower=0> J_saleaffiliation;
+  int<lower=0> J_year_factor;
+  
+  int<lower=0> N_test;
+  
+  matrix[N, K] X;
+  matrix[N_test, K] X_test;
+  vector[N] log_saleprice;
+  
+  int<lower=0, upper=J_msa> msa[N]; 
+  int<lower=0, upper=J_tract> tract[N]; 
+  int<lower=0, upper=J_category> category[N]; 
+  int<lower=0, upper=J_saleaffiliation> saleaffiliation[N]; 
+  int<lower=0, upper=J_year_factor> year_factor[N]; 
+
+  int<lower=0, upper=J_msa> msa_test[N_test]; 
+  int<lower=0, upper=J_tract> tract_test[N_test]; 
+  int<lower=0, upper=J_category> category_test[N_test];
+  int<lower=0, upper=J_saleaffiliation> saleaffiliation_test[N_test]; 
+  int<lower=0, upper=J_year_factor> year_factor_test[N_test]; 
+  
+  real mu_y; //Moments of target variable for prior for intercept 
+  real<lower=0> sd_y;
+}
+
+parameters{
+  real intercept;
+  vector [K] b;
+  
+  vector[J_msa] a_msa; //surprisingly, indexing seems to be 1-based
+  vector[J_tract] a_tract;
+  vector[J_category] a_category;
+  vector[J_saleaffiliation] a_affiliation;
+  vector[J_year_factor] a_year;
+  
+  real<lower=0,upper=sd_y> sigma_y;
+  real<lower=0,upper=sd_y> sigma_msa;
+  real<lower=0,upper=sd_y> sigma_tract;
+  real<lower=0,upper=sd_y> sigma_category;
+  real<lower=0,upper=sd_y> sigma_affiliation;
+  real<lower=0,upper=sd_y> sigma_year;
+}
+transformed parameters {
+  vector [N] y_hat;
+  for (n in 1:N)
+    y_hat[n] = intercept + a_msa[msa[n]] + a_tract[tract[n]] + 
+      a_category[category[n]] + a_affiliation[saleaffiliation[n]]  +
+      a_year[year_factor[n]] + X[n, ] * b;
+}  
+
+model {
+  //random intercepts
+  a_msa ~ normal(0, sigma_msa);
+  a_tract ~ normal(0, sigma_tract);
+  a_category ~ normal(0, sigma_category);
+  a_affiliation ~ normal(0, sigma_affiliation);
+  a_year ~ normal(0, sigma_year);
+  
+  //Priors
+  sigma_y ~ cauchy(0.3, 1);
+  b ~ normal(0, .5 * sd_y);
+  intercept ~ normal(mu_y, 0.1 * sd_y);
+  
+  //Hyper-priors
+  sigma_msa ~ cauchy(0, .3 * sd_y);
+  sigma_tract ~ cauchy(0, .3 * sd_y);
+  sigma_category ~ cauchy(0, .25 * sd_y);
+  sigma_affiliation ~ cauchy(0, .2 * sd_y);
+  sigma_year ~ cauchy(0, .25 * sd_y);
+
+  //likelihood
+  log_saleprice ~ normal(y_hat, sigma_y);
+}
+generated quantities {
+  vector[N] ll;  //log likelihood for LOOCV
+  vector[N] residuals; //save residuals
+  vector[N_test] y_pred_test;  //prediction on test set
+
+  // Log likelihood (for eldp) and residuals
+  for (n in 1:N)
+    ll[n] = normal_lpdf(log_saleprice [n] | y_hat[n], sigma_y);
+    residuals = log_saleprice - y_hat;
+
+  // Prediction on test set
+  for (n in 1:N_test)
+    y_pred_test[n] = normal_rng(
+        intercept + a_msa[msa_test[n]] + a_tract[tract_test[n]] + 
+        a_category[category_test[n]] +
+        a_affiliation[saleaffiliation_test[n]]  +
+        a_year[year_factor_test[n]] + 
+        X_test[n, ]* b,
+        sigma_y);
+}
+"
+
+# Estimate model (comment out if already saved)
+stan_1_3 <- stan(model_code = stan_1_3_code, data = stan_data_1_3, cores = 3,
+                 chains = 3, iter =  1500)
+# Save
+save(stan_1_3, file = "stan_1_3.RData")
+```
+
+#### Model checking
+Before we interpret any coefficients, let's first make sure that the parameter estimates have reached a stationary 
+distribution by checking the trace plots. Since we estimated too many random
+intercepts to inspect all of them, let's randomly choose 3 from each group:
+
+```{r, fig.height=13, fig.width=12}
+# Sample random intercepts to plot
+a_msa_samples <- sample(stan_data_1_3$J_msa, size = 3, replace = FALSE)
+a_tract_samples <- sample(stan_data_1_3$J_category, size = 3, replace = FALSE)
+a_category_samples <- 1:nlevels(data_train$category)
+a_aff_samples <- sample(stan_data_1_3$J_saleaffiliation, size = 3, replace = FALSE)
+a_year_samples <- sample(stan_data_1_3$J_year_factor, size = 3, replace = FALSE)
+
+
+parameters_to_plot = c(paste("b[", 1:stan_data_1_3$K, "]", sep = ""), 
+                       paste("a_msa[", a_msa_samples, "]", sep = ""), 
+                       paste("a_tract[", a_tract_samples, "]", sep = ""), 
+                       paste("a_category[", a_category_samples, "]", sep = ""), 
+                       paste("a_affiliation[", a_aff_samples, "]", sep = ""), 
+                       paste("a_year[", a_year_samples, "]", sep = ""), 
+                       "sigma_y", "sigma_msa", "sigma_tract", "sigma_category", 
+                       "sigma_affiliation", "sigma_year", "lp__")
+stan_trace(stan_1_3, inc_warmup = FALSE, pars = parameters_to_plot)  #Looks good
+```
+
+Looks good, The distribution of all parameters that we examined seems 
+stationary. Since we could not manually inspect the distribution of all 
+parameters, let's look at the maximum value that the RHat statistic takes.
+This statistic estimates whether the distribution has reached stationarity by
+comparing within-chain variance with between-chain variance.
+
+```{r}
+#Maximum Rhat
+max(summary (stan_1_3)$summary[, "Rhat"])  #Looks good
+```
+
+For all parameters, these are easily below 1.1, as recommended by Andrew Gelman.
+Thus, all parameter distributions seem to be stationary. In other words, the
+parameter estimates seem to be trustworthy.
+
+Finally, let's inspect the residuals to see if there is any evidence of
+nonlinearity or of influential points (points which are both far away from where
+most points are, and which also have large residuals). In order to make it 
+easier to diagnose nonlinearity, I have added a smoother, which should hover
+around 0 everywhere if there is no nonlinearity present.
+Let's start with the model were all continuous variable enter as logs:
+```{r}
+plot_stan_residuals <- function(stan_model, variables, data, 
+                                 title = NULL, 
+                                 xlabels = NULL, ylabel = "residuals",
+                                 alpha = 0.2, dimensions = NULL){
+  # Plots residuals versus features, and adds a smoother. For each observation,
+  # the mean residual is used.  In other words, we abstract from the 
+  # uncertainty of parameter estimates, but this should not be a problem.
+  # 
+  # Args:
+  # -----
+  #
+  # stan_model: Name of the Stan model
+  # variables: character vector with names of the variables to plot,
+  # data: data frame that holds the original data.  (Not the list with the input
+  #     data that is fed into Stan.
+  # title: string; optional. Custom title for plots. Default: None, which uses
+  #     the model name from the .stan as the title. (Note that this is different
+  #     from the name of the name to  which the stand model was assigned in R. 
+  #     Thus, it is recommended to set a custom title if the same .stan file is
+  #     reused to estimate different models.)
+  # alpha: numeric between 0 and 1; optional; adjusts transparency to avoid overplotting.
+  # dimensions: vector of positive integers of length 2; optional; gives number of rows
+  #     and columns for arranging plots.
+  # xlabels: character vector; default NULL; labels for x-axes
+  # ylabel: character string; default "residuals"; labels for y-axes
+  #
+  # Returns:
+  # -------
+  #
+  # None (only prints the plots) 
+  
+    # Extract the residuals from the model
+    residuals <- extract(stan_model)$residuals
+    
+    # For now, ignore parameter uncertainty and simply compute average
+    # residual for for each observation.
+    data$residuals_mean <- apply(residuals, 2, mean)
+    
+    # Set title to default or custom
+    if (is.null(title)) 
+        plot_title <- paste("Model:", stan_model@model_name) else plot_title <- title
+    
+    
+    library(ggplot2)
+    plot_list = list()  #initialize list to store all the individual plots
+    
+    # Initialize counter to keep track of xlabels
+    i = 1
+    
+    # Create all plots and add them to a list
+    for (variable in variables) {
+        # Set labels for x-axis to default or custom
+        xlabel <- ifelse(is.null(xlabels), variable, xlabels[i])
+        
+        # Note that we are using aes_string instead of aes, since we get the
+        # variables to plot as strings.
+        plot_list[[variable]] <- ggplot(data = data, aes_string(x = variable, 
+            y = "residuals_mean")) + # coord_trans (x = 'log') + #Doesn't work if variable contains zeros,
+        labs(y = ylabel, x = xlabel) + geom_point(alpha = alpha) + geom_smooth()  #Add smoother
+        
+        # Increment counter
+        i = i + 1
+    }
+    
+    # Combine all the plots into one. Note that I don't load the ggpubr
+    # package since it masks RStan's extract()
+    figure <- ggpubr::ggarrange(plotlist = plot_list)  #, labels = variables) 
+    # Deleted labels because I didn't have the time yet to arrange them
+    # properly.
+    
+    # Add title
+    ggpubr::annotate_figure(figure, top = ggpubr::text_grob(plot_title, 
+        face = "bold", size = 14), 
+        bottom = ggpubr::text_grob("Smoothers using GAM added in blue"))
+}
+    
+# Plot
+plot_stan_residuals (stan_1_3, 
+                     c("log_sizesf", "log1_landsf", "log1_age", 
+                       "log_rooms", "log_floors", "log1_largestmeetingspace"), 
+                     xlabels = c ("log(size in sf)", "log(1 + land in sf)",
+                                  "log(1 + age at sale)", "log(rooms)",
+                                  "log(floors)", 
+                                  "log(1 + largest meeting space)"
+                                  ),
+                     title = "1.3: All logarithms",
+                     data = data_train)
+```
+
+The residual plots show no major problems, but they indicate that the 
+relationships for most of these variables might be slightly more complex than
+linear on the log scale (constant elasticity on the original scale). 
+However, the residuals do not simply indicate a polynomial relationship but
+seem to require a more flexible model, such as a General Additive Model. 
+Still, our linear model captures the relationship pretty well, indicated by the
+fact that the confidence intervals of the smoother do include 0 almost 
+everywhere.
+
+For comparison, let's see how well a model with polynomial terms instead of 
+logs for age or floors fit, starting with the former. (The code for estimating
+the model will not be reproduced here.)
+Note that it is not initially obvious on what scale to plot variables that enter
+both as levels and squares. Since the level only functions to shift the origin of
+the polynomial, we can think of this as equivalent to only using square terms 
+but subtracting a constant from the variable before squaring to shift the parabola along the x-axis. (Strictly speaking, we would also have to add a constant in order to shift the parabola in the y-direction, but this is not necessary for our purposes because adding a constant only moves the intercept of the regression.) However, I plot the residuals for both this centered
+square term as well as for the level to show that the latter can mislead us about
+influential and leverage points.Furthermore, I only do this for models that fit well enough otherwise.
+
+# Interpreting the Coefficients
+Let's now take a look at the effect sizes. The percentages in the tables below tell us the percentiles of the (posterior) distribution of our parameter estimates. E.g., we can say that with 50% probability, the true value lies between 25% and 75%. (Note that this is different from the meaning of a confidence interval in a non-Bayesian context). "sd" gives the standard deviation of this distribution, while "se_mean" tells us how much the uncertainty of our parameter estimates is increased by running only a finite amount of MCMC samples (in this final version, I ran enough samples that it is small enough to be ignored). 
+
+Remember that, even though I had to standardize all continuous variables to estimate the model, the effect sizes shown are converted back to the original scale.
+
+Before we take a look at our result, let's define a function that formats the output. Firstly, it adds the variable names to the coefficient vecotor. Secondly it converts the coefficients off standardize variables back to the original scale, so that we can interpret the effect size.
+
+```{r}
+
+### Function to pretty print Stan output:
+get_stan_coefs <- function(stan_model, stan_data, original_scale = TRUE, 
+                           y_standardized = FALSE, digits = 3, print = TRUE) {
+  # Returns and prints summary of a stan model that was defined using matrix 
+  # multiplication by converting coefficients to original scale and adding 
+  # variable names to coefficient names.
+  #
+  # Args:
+  #   stan_model: Stan model objects for which to print coefficients.
+  #   stan_data: list, which holds the data used to estimate model, generated by
+  #              (or of same format as) make_stan_data().
+  #   original_scale: boolean, whether to print coefficients on standardized or
+  #               original scale. Default: original scale.
+  #   y_standardized: boolean, whether the dependent variable was also
+  #               standardized. Only needs to be specified if original_scale = T.
+  #               Default: FALSE.
+  #   digits: numeric, number of decimals to print for each entry. Default: 3.
+  #
+  # Returns:
+  #   list
+  
+  # Select only fixed effects
+  parameters_to_print = c(paste("b[", 1:(stan_data[["K"]]), "]", sep = ""))
+  # create a data frame of the parameter estimates for the fixed effects
+  df <- summary(stan_model, pars = parameters_to_print)$summary
+  
+  # append substantive names to parameter estimates
+  rownames(df) <- paste("b", colnames(stan_data[["X"]]), sep = "_")
+  
+  # If specified, convert parameters to original scale (Remember we divided by 2 standard deviations)
+  if (original_scale == TRUE) {
+    if (y_standardized == TRUE) 
+      stop("Not implemented yet.")
+    for (parameter in 1:nrow(df)) {
+      # If the saved standard deviation is NA, the variable was not standardized because it is not continuous.        
+      # Therefore, go on to next parameter.
+      if (is.na(stan_data$sd_x[parameter])) 
+        next else {
+          # Otherwise, divide the first 8 elements of each row (that's what contains coefficients) by twice the standard deviation (remember
+          # that's how we standardized variables)
+          df[parameter, 1:8] <- df[parameter, 1:8]/(2 * stan_data$sd_x[parameter])
+        }
+    }
+  }
+  
+  # Select intercept plus variance parameters for error and random effects
+  re_to_print <- rownames(summary(stan_model)$summary)[startsWith(rownames(summary(stan_model)$summary), "sigma")]
+  df_2 <- summary(stan_model, pars = c("intercept", re_to_print))$summary
+  
+  # Concatenate both data frames
+  df_combined <- rbind(df, df_2)
+  
+  # Print (if specified) and return
+  if (print == TRUE) print(round(df_combined, digits = digits))
+  return(list(b = df[, "mean"], 
+              intercept = summary(stan_model, pars = "intercept")$summary[, "mean"],
+              all = summary(stan_model)$summary[, "mean"]))
+}
+
+# Print model (parameter estimates for standardized predictors are converted back to original scale)
+stan_coefs_1_3_orig_scale <- get_stan_coefs(stan_1_3, stan_data_1_3)
+```
+
+The results are  similar to Das et al (2017). For example, increasing square footage by 1% is estimated to increase the price by about 0.14%, and increasing the number of rooms by 1% is estimated to increase the price by .46% in both models. In their most similar model, Das et al (2017) estimate these effects as .22% and .42%, respectively.
+
+For comparison, let's also estimate a non-Bayesian multilevel model with maximum likelihood (which is less sensitive to errors):
+
+```{r}
+# Frequentist (maximum likelihood) estimate of hierarchical model for comparison====
+library (lme4)
+lmer_1_3 <- lmer (log_saleprice ~ log_sizesf + log1_landsf +
+                    log1_age + log_rooms + log_floors + log1_largestmeetingspace + 
+                    operation + selfrun + portfolio + multiproperty + location  +  
+                    cbd + indoorcorridors + restaurant + convention +
+                    conference + ski + spa + golf + boutique +
+                    allsuites + casino + quarter +
+                    (1 |msa) + (1 | tract) + (1|category) + (1|year), 
+                  data=data_train)
+summary(lmer_1_3)
+
+```
+Again, the results look similar.
+
+The next step in the future will be to perform cross-validation (measuring predictive accuracy on new data).  Since the coefficient estimates were not substantially different from OLS, it is here that we will be able to see how much of an improvement in predictive accuracy we get from using this more complicated model.
+
+# Shrinkage
+The central advantage of a hierarchical model is that it performs an adaptive shrinkage for group-level parameters (in our case the intercepts for the different MSAs, tracts, hotel categories and affiliations, and years): It avoids overfitting these parameter estimates to the particular data we happen to observe by shrinking parameter estimates towards zero, and it takes into account that we have greater uncertainty about groups for which the sample size is lower or for which the variance between different groups is higher. In the extreme case, as the number of observations for a particular group goes towards infinity, virtually no shrinkage is performed because we do have enough information to estimate the effect precisely. Conversely, if we only have one observation for a particular group, our best estimate is going to be close to zero. (For example, if we only have one observation for a particular city, our best estimate for the intercept of that city is close to 0.) The reason that the individual group effects are shrunken towards zero and not to some group average is that the effect of the average group (MSA, year, etc.) is by definition zero, because our model contains an intercept that absorbs all constants. 
+
+Let us plot this shrinkage for the random intercept for different MSAs. To that end, we will sort the MSAs by the number of observations, and then we will plot for each observation both the OLS estimate (green) and the estimate of the hierarchical model (red). Note that this is not the same OLS model as above, which ignored MSA and thus estimated the effect to be 0 everywhere ("complete pooling"). Rather, this OLS model now includes a separate intercept for each MSA ("no pooling").  We will see that the hierarchical model is a compromise between those 2 extremes, but as explained above it is a smart compromise that is closer to complete pooling for small groups, and is closer to no pooling for large groups.
+
+```{r}
+### Plot shrinkage====
+## Start with MSA
+# First create a data frame with columns for both the random effecs and the
+# unpooled estimates, as well as the number of samples for each group (for 
+# sorting).
+msa_estimates <- data.frame(matrix(nrow = nlevels(data_train$msa), ncol = 4))
+names(msa_estimates) <- c("random_effects", "unpooled", 
+                          "sample_size", "rank")
+rownames(msa_estimates) <- levels(data_train$msa)
+  
+# Compute the mean estimate for the random intercept for each MSA
+msa_estimates[, 1] <- apply(extract(stan_1_3)$a_msa, 2, mean)
+
+# Add unpooled intercepts from OLS
+# Estimate OLS without intercept with the variable of interest 1st (if multiple
+# factors are included, so that the 1st group will not be dropped in order to
+# avoid collinearity.)
+ols_msa <- lm(log_saleprice ~ -1 + msa + log_sizesf + log1_landsf +
+             log1_age + log_rooms + log_floors +  
+             operation + selfrun + portfolio + multiproperty + location  +  
+             cbd + indoorcorridors + restaurant + convention +
+             conference + ski + spa + golf + boutique +
+             allsuites + casino + quarter + year +  
+             category + year, data = data_train)
+
+# Add coefficients to data frame
+msa_estimates[, 2] <- coef(ols_msa)[1:nrow(msa_estimates)]
+
+# Subtract the mean from unpooled estimates since we did not include an intercept
+msa_estimates[, 2] <- msa_estimates[, 2] - mean(msa_estimates[, 2])
+
+## Check that we selected the right coefficients. First check that both the 1st and
+## last coefficients we selected belong to the variable of interest
+selected_coefficients <- names(coef(ols_msa))[1:nrow(msa_estimates)]
+if (!all(startsWith(selected_coefficients, "msa"))) {
+    stop("some of the selected coefficients for the pooled data belong to other
+        variables.")
+}
+
+# Make sure that the 1st coefficient not selected belongs to a different variable
+next_coefficient <- names(coef(ols_msa))[nrow(msa_estimates) + 1]
+if (startsWith(next_coefficient, "msa")) {
+    stop("not all coefficient selected")
+}
+
+# Number of samples for each group
+msa_estimates[, 3] <- as.vector(table(data_train$msa))
+
+# Sort by number of samples
+msa_estimates <- msa_estimates[order(msa_estimates$sample_size), ]
+
+# rank for each group
+msa_estimates[, 4] <- 1:nrow(msa_estimates)
+
+# Drop sample size (to make plotting easier)====
+msa_estimates <- msa_estimates[, c(-3)]
+
+# Reshape data frame from a wide to long format for ggplot
+library(reshape2)
+msa_estimates_long <- melt(data = msa_estimates, id.vars = "rank")
+
+# Plot data Shrinkage
+library(ggplot2)
+ggplot(msa_estimates_long, aes(y = value, x = rank, color = variable, 
+                               group = rank)) + 
+      geom_point() + geom_line() + scale_x_continuous(
+        name = "Size of MSA (Rank)") + 
+      scale_y_continuous(name = "Effect size of MSA")
+ggtitle("Shrinkage")
+```
+
+The above plot shows the essence of a hierarchical model: For MSAs with a small sample size (left) there is a large difference between the OLS estimates(green) and the random effects estimates of the hierarchical model (red), because the latter pulls the extreme estimates back towards zero (the red vertical lines are long). As we moved to the right, the sample size from each MSA increases; as a result, their coefficients can be estimated more precisely, and thus the hierarchical model shrinks these coefficients to an increasingly small extent (the red vertical lines get shorter).  Consequently, the estimates of the hierarchical model become larger in absolute value. In order to better show this last point, let us only plot the estimates from the hierarchical model in a separate graph: 
+```{r}
+#Plot only the random effect estimates
+ggplot(msa_estimates, aes(y = random_effects, x = rank)) + geom_point()
+```
+
+(Note that, for MSAs with the highest sample sizes (right), the majority of the extreme values is positive rather than negative. This is to be expected, because MSAs with the highest population tend to have the highest property prices, and due to their high population there will also be a larger number of hotels, leading to a higher sample size.)
+
+
+# Interpreting the random effects
+Now let's take a look at the random effects, to see where the biggest source of variation lies.
+
+```{r}
+# Initialize empty list to hold estimates for the random intercept for
+# all groups (Will be converted to data frame once we know the needed
+# dimension)====
+re_list <- list()
+for (random_intercept in c("msa", "tract", "cat", "op", "aff", "year")) {
+    # select all the estimates for the random intercepts for all groups
+    model_parameters <- as.data.frame(stan_1_3)
+    # For each grouping variable, combine all estimates in a vector
+    re_list[[random_intercept]] <- unlist(
+        model_parameters[, startsWith(names(model_parameters), 
+        paste("a", random_intercept, sep = "_"))])
+}
+
+# Find the length of the longest vector of random intercepts, as well
+# as the the number of random intercepts/grouping variables
+maximum_length <- 0
+n_re <- 0
+for (re_vector in re_list) {
+    if (length(re_vector) > maximum_length) 
+        maximum_length <- length(re_vector)
+    n_re <- n_re + 1
+}
+
+# Combine all vectors of random intercepts in a data frame
+re_frame <- data.frame(matrix(nrow = maximum_length, ncol = n_re))
+column_counter <- 1  #counter to keep track of columns
+for (re_vector in re_list) {
+    re_frame[1:length(re_vector), column_counter] <- re_vector
+    names(re_frame)[column_counter] <- names(re_list)[column_counter]
+    column_counter = column_counter + 1
+}
+
+# Create density plot====
+re_stack <- stack(re_frame)
+ggplot(re_stack, aes(x = values)) + geom_density(aes(group = ind, colour = ind, 
+    fill = ind), alpha = 0.3)
+```
+
+# Measuring accuracy
+In order to assess how much better the hierarchical model is compared to the baseline model (OLS with complete pooling), we need to measure the model's predictive accuracy on * new * data. That's why we withheld the last 1.5 years to use as an independent test set. Predictive accuracy will be measured as the root mean squared error. This is roughly equal to the expected value of a prediction's error as a percentage of the true price..
+I will first compute the overall error rates for both models, and then will disaggregate this overall error by the sample size of the metropolitan area.  This should show that the hierarchical model's advantage becomes bigger the smaller this sample size.
+
+
+Evaluate fit of predictions from generated quantities.
+
+```{r}
+# Compute mean prediction for each observation in test set
+log_y_pred <- apply(
+                extract(stan_1_3)$y_pred_test[501:1500, ],
+                2, mean)
+y_pred <- exp(log_y_pred)
+
+# Residuals on log scale
+resids_log_stan_1_3 <- data_test$log_saleprice - log_y_pred
+# Residuals on original scale
+resids_stan_1_3 <- data_test$saleprice - y_pred
+
+# Root mean squared log error 
+rmsle_stan_1_3 <- sqrt(mean((resids_log_stan_1_3)**2))
+rmsle_stan_1_3
+# Root mean squared error
+rmse_stan_1_3 <- sqrt(mean((resids_stan_1_3)**2))
+rmse_stan_1_3
+
+rSquared(data_test$log_saleprice, resids_log_stan_1_3) # 0.69
+rSquared(data_test$saleprice, resids_stan_1_3) # -2.06
+```
+
+```{r}
+# data_train_ols <- data_train
+# data_test_ols <- data_test
+# # Add 2017 as an extra level of year_factor to training set
+# levels(data_train_ols$year_factor) <- c(levels(data_train_ols$year_factor), 
+#                                         "2017")
+# 
+# # Modify test data: Set year to most recent year from training set
+# data_test_ols <- data_test
+# levels(data_test_ols$year_factor) <- levels(data_train_ols$year_factor)
+# data_test_ols[, "year"] <- "2016"
+# # data_test$year_factor <- as.factor(data_test$year)
+# 
+
+
+# Pooled estimate (OLS without intercepts for large categories (MSA, tract,
+# sale affiliation)
+ols_up <- lm(log_saleprice ~ log_sizesf + log1_landsf +
+              log1_age + log_rooms + log_floors + log1_largestmeetingspace + 
+              operation + selfrun + portfolio + multiproperty + location  +  
+              cbd + indoorcorridors + restaurant + convention + conference + 
+              ski + spa + golf + boutique + allsuites + casino + 
+              quarter + msa + tract + category + saleaffiliation + year_factor,
+              data = data_train)
+# summary(ols_up) # Uncommented bcbecause of long printout
+
+# Unpooled (OLS with intercept for all categories included in hierarchical model)
+ols_p <- lm(log_saleprice ~ log_sizesf + log1_landsf +
+              log1_age + log_rooms + log_floors + log1_largestmeetingspace + 
+              operation + selfrun + portfolio + multiproperty + location  +  
+              cbd + indoorcorridors + restaurant + convention + conference + 
+              ski + spa + golf + boutique + allsuites + casino + 
+              quarter + category + year_factor,
+              data = data_train)
+summary(ols_p)
+
+
+## Predictions
+## ===========
+
+# For pooled model
+# ---------------
+log_y_ols_up <- predict(ols_up, data_test)
+log_y_ols_p <- predict(ols_p, data_test)
+
+# Predicted value on original scale
+y_ols_p <- exp(log_y_ols_p)
+
+# Residuals on log scale
+resids_log_ols_p <- data_test$log_saleprice - log_y_ols_p
+# Residuals on original scale
+resids_ols_p <- data_test$saleprice - y_ols_p
+
+# Root mean squared log error 
+rmsle_ols_p <- sqrt(mean((resids_log_ols_p)**2))
+rmsle_ols_p # 0.58
+# Root mean squared error
+rmse_ols_p <- sqrt(mean((resids_ols_p)**2))
+rmse_ols_p
+
+# R_2
+rSquared(data_test$log_saleprice, resids_log_ols_p) # 0.78
+rSquared(data_test$saleprice, resids_ols_p) # 0.69
+
+# For UN-pooled model
+# ------------------
+# Predicted value on original scale
+y_ols_up <- exp(log_y_ols_up)
+
+# Residuals on log scale
+resids_log_ols_up <- data_test$log_saleprice - log_y_ols_up
+# Residuals on original scale
+resids_ols_up <- data_test$saleprice - y_ols_up
+
+# Root mean squared log error 
+rmsle_ols_up <- sqrt(mean((resids_log_ols_up)**2)) 
+rmsle_ols_up # 0.52
+# Root mean squared error
+rmse_ols_up <- sqrt(mean((resids_ols_up)**2))
+rmse_ols_up
+
+# R_2
+rSquared(data_test$log_saleprice, resids_log_ols_up) # 0.82
+rSquared(data_test$saleprice, resids_ols_up) # 0.62
+
+
+# Compare means between all models, as well as original data
+# ==========================================================
+
+# Original scale
+mean(data_test$saleprice) / 1E6
+mean(y_pred) / 1E6
+mean(y_ols_p) /1E6
+mean(y_ols_up) / 1E6
+
+# Log scale
+mean(data_test$log_saleprice) 
+mean(log_y_pred) 
+mean(log_y_ols_p)
+mean(log_y_ols_up)
+# We see thatwhen we convert the prediction to the original scale, the
+# hierarchical model has a extreme upwards bias, whereas the other models have a 
+# smaller downward bias.  This is strange.
+```
